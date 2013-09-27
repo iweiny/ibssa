@@ -47,7 +47,6 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <syslog.h>
-#include <infiniband/acm.h>
 #include <infiniband/umad.h>
 #include <infiniband/umad_str.h>
 #include <infiniband/verbs.h>

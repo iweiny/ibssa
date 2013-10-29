@@ -3504,7 +3504,6 @@ int main(int argc, char **argv)
 
 	pthread_create(&ctrl_thread, NULL, acm_ctrl_handler, NULL);
 
-
 	if (acm_open_devices()) {
 		ssa_log_err(0, "unable to open any devices\n");
 		return -1;

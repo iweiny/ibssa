@@ -52,7 +52,7 @@
 #include <infiniband/umad.h>
 #include <infiniband/umad_str.h>
 #include <infiniband/verbs.h>
-#include <infiniband/ssa_mad.h>
+#include <infiniband/ssa.h>
 #include <infiniband/ib.h>
 #include <dlist.h>
 #include <search.h>
@@ -86,6 +86,11 @@ static const char * month_str[] = {
 
 static int log_level = SSA_LOG_DEFAULT;
 //static short server_port = 6125;
+
+/* Forward declarations */
+static int ssa_downstream_svc_server(struct ssa_svc *svc);
+static int ssa_upstream_initiate_conn(struct ssa_svc *svc);
+static void ssa_upstream_svc_client(struct ssa_svc *svc, int errnum);
 
 void ssa_set_log_level(int level)
 {
@@ -311,39 +316,7 @@ static void ssa_svc_join(struct ssa_svc *svc)
 	}
 }
 
-static int ssa_svc_modify(struct ssa_svc *svc, int fd_slot, int events)
-{
-	struct ssa_class *ssa;
-
-	ssa = svc->port->dev->ssa;
-	if (fd_slot >= (ssa->nfds + ssa->nsfds))
-		return -1;
-	if (ssa->fds[fd_slot].fd != -1) {
-		ssa->fds[fd_slot].events = events;
-		return fd_slot;
-	}
-	return -1;
-}
-
-static int ssa_svc_insert(struct ssa_svc *svc, int fd, int events)
-{
-	struct ssa_class *ssa;
-	int i;
-
-	ssa = svc->port->dev->ssa;
-	for (i = ssa->sfds_start; i < ssa->sfds_start + ssa->nsfds; i++) {
-		if ((ssa->fds[i].fd == -1) && (ssa->fds_obj[i].svc == NULL)) {
-			ssa->fds[i].fd = fd;
-			ssa->fds[i].events = events;
-			ssa->fds_obj[i].svc = svc;
-			ssa->nfds++;
-			return i;
-		}
-	}
-	return -1;
-}
-
-static void ssa_svc_listen(struct ssa_svc *svc)
+static int ssa_downstream_listen(struct ssa_svc *svc)
 {
 	int sport = 7470;
 	struct sockaddr_ib src_addr;
@@ -351,23 +324,23 @@ static void ssa_svc_listen(struct ssa_svc *svc)
 
 	/* Only listening on rsocket when server (not consumer - ACM) */
 	if (svc->port->dev->ssa->node_type == SSA_NODE_CONSUMER)
-		return;
+		return -1;
 
-	if (svc->rsock >= 0)
-		return;
+	if (svc->conn_listen.rsock >= 0)
+		return -1;
 
 	ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL, "%s\n", svc->port->name);
 
-	svc->rsock = rsocket(AF_IB, SOCK_STREAM, 0);
-	if (svc->rsock < 0) {
+	svc->conn_listen.rsock = rsocket(AF_IB, SOCK_STREAM, 0);
+	if (svc->conn_listen.rsock < 0) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rsocket ERROR %d (%s)\n",
 			errno, strerror(errno));
-		return;
+		return -1;
 	}
 
 	val = 1;
-	ret = rsetsockopt(svc->rsock, SOL_SOCKET, SO_REUSEADDR,
+	ret = rsetsockopt(svc->conn_listen.rsock, SOL_SOCKET, SO_REUSEADDR,
 			  &val, sizeof val);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
@@ -376,7 +349,7 @@ static void ssa_svc_listen(struct ssa_svc *svc)
 		goto err;
 	}
 
-	ret = rsetsockopt(svc->rsock, IPPROTO_TCP, TCP_NODELAY,
+	ret = rsetsockopt(svc->conn_listen.rsock, IPPROTO_TCP, TCP_NODELAY,
 			  (void *) &val, sizeof(val));
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
@@ -384,7 +357,7 @@ static void ssa_svc_listen(struct ssa_svc *svc)
 			errno, strerror(errno));
 		goto err;
 	}
-	ret = rfcntl(svc->rsock, F_SETFL, O_NONBLOCK);
+	ret = rfcntl(svc->conn_listen.rsock, F_SETFL, O_NONBLOCK);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rfcntl ERROR %d (%s)\n",
@@ -400,30 +373,30 @@ static void ssa_svc_listen(struct ssa_svc *svc)
 	src_addr.sib_scope_id = 0;
 	memcpy(&src_addr.sib_addr, &svc->port->gid, 16);
 
-	ret = rbind(svc->rsock, (const struct sockaddr *) &src_addr, sizeof(src_addr));
+	ret = rbind(svc->conn_listen.rsock, (const struct sockaddr *) &src_addr,
+		    sizeof(src_addr));
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rbind ERROR %d (%s)\n",
 			errno, strerror(errno));
 		goto err;
 	}
-	ret = rlisten(svc->rsock, 1);
+	ret = rlisten(svc->conn_listen.rsock, 1);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rlisten ERROR %d (%s)\n",
 			errno, strerror(errno));
 		goto err;
 	}
+	svc->conn_listen.state = SSA_CONN_LISTENING;
 
-	svc->slot = ssa_svc_insert(svc, svc->rsock, POLLIN);
-	if (svc->slot >= 0)
-		return;
-
-	ssa_log_err(SSA_LOG_CTRL, "no service slot available\n");
+	return svc->conn_listen.rsock;
 
 err:
-	rclose(svc->rsock);
-	svc->rsock = -1;
+	rclose(svc->conn_listen.rsock);
+	svc->conn_listen.rsock = -1;
+	svc->conn_listen.state = SSA_CONN_IDLE;
+	return -1;
 }
 
 void ssa_svc_query_path(struct ssa_svc *svc, union ibv_gid *dgid,
@@ -450,9 +423,15 @@ static void ssa_upstream_dev_event(struct ssa_svc *svc, struct ssa_ctrl_msg_buf 
 	switch (msg->data.event) {
 	case IBV_EVENT_CLIENT_REREGISTER:
 	case IBV_EVENT_PORT_ERR:
-		if (svc->rsock >= 0) {
-			rclose(svc->rsock);
-			svc->rsock = -1;
+		if (svc->conn_listen.rsock >= 0) {
+			rclose(svc->conn_listen.rsock);
+			svc->conn_listen.rsock = -1;
+			svc->conn_listen.state = SSA_CONN_IDLE;
+		}
+		if (svc->conn_data.rsock >= 0) {
+			rclose(svc->conn_data.rsock);
+			svc->conn_data.rsock = -1;
+			svc->conn_data.state = SSA_CONN_IDLE;
 		}
 		svc->state = SSA_STATE_IDLE;
 		/* fall through to reactivate */
@@ -530,39 +509,355 @@ void ssa_upstream_mad(struct ssa_svc *svc, struct ssa_ctrl_msg_buf *msg)
 static void *ssa_upstream_handler(void *context)
 {
 	struct ssa_svc *svc = context;
+	struct ssa_conn_req_msg *conn;
 	struct ssa_ctrl_msg_buf msg;
+	struct pollfd fds[3];
+	int ret, errnum;
 
 	ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL, "%s\n", svc->name);
-	msg.hdr.len = sizeof msg;
+	msg.hdr.len = sizeof msg.hdr;
 	msg.hdr.type = SSA_CTRL_ACK;
 	write(svc->sock_upctrl[1], (char *) &msg, sizeof msg.hdr);
 
-	while (msg.hdr.type != SSA_CTRL_EXIT) {
-		read(svc->sock_upctrl[1], (char *) &msg, sizeof msg.hdr);
-		if (msg.hdr.len > sizeof msg.hdr) {
-			read(svc->sock_upctrl[1], (char *) &msg.hdr.data,
-			     msg.hdr.len - sizeof msg.hdr);
-		}
-		if (svc->process_msg && svc->process_msg(svc, &msg))
-			continue;
+	fds[0].fd = svc->sock_upctrl[1];
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
+	fds[1].fd = svc->sock_accessup[0];
+	fds[1].events = POLLIN;
+	fds[1].revents = 0;
+	fds[2].fd = -1;		/* placeholder for data rsock */
+	fds[2].events = 0;
+	fds[2].revents = 0;
 
-		switch (msg.hdr.type) {
-		case SSA_CTRL_MAD:
-			ssa_upstream_mad(svc, &msg);
-			break;
-		case SSA_CTRL_DEV_EVENT:
-			ssa_upstream_dev_event(svc, &msg);
-			break;
-		case SSA_CTRL_EXIT:
-			break;
-		default:
-			ssa_log_warn(SSA_LOG_CTRL,
-				     "ignoring unexpected message type %d\n",
-				     msg.hdr.type);
-			break;
+	for (;;) {
+		ret = rpoll(&fds[0], 3, -1);
+		if (ret < 0) {
+			ssa_log_err(SSA_LOG_CTRL, "polling fds %d (%s)\n",
+				    errno, strerror(errno));
+			continue;
+		}
+		errnum = errno;
+		if (fds[0].revents) {
+			fds[0].revents = 0;
+			read(svc->sock_upctrl[1], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_upctrl[1],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+
+			switch (msg.hdr.type) {
+			case SSA_CTRL_MAD:
+				ssa_upstream_mad(svc, &msg);
+				break;
+			case SSA_CTRL_DEV_EVENT:
+				ssa_upstream_dev_event(svc, &msg);
+				break;
+			case SSA_CONN_REQ:
+				conn = (struct ssa_conn_req_msg *) &msg;
+				fds[2].fd = ssa_upstream_initiate_conn(conn->svc);
+				/* Change when more than 1 data connection supported !!! */
+				if (fds[2].fd >= 0 &&
+				    conn->svc->conn_data.state != SSA_CONN_CONNECTED)
+					fds[2].events = POLLOUT;
+				break;
+			case SSA_CTRL_EXIT:
+				goto out;
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from ctrl\n",
+					     msg.hdr.type);
+				break;
+			}
+		}
+
+		if (fds[1].revents) {
+			fds[1].revents = 0;
+			read(svc->sock_accessup[0], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_accessup[0],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from access\n",
+					     msg.hdr.type);
+				break;
+			}
+		}
+
+		if (fds[2].revents) {
+			fds[2].revents = 0;
+			/* Only 1 data connection right now !!! */
+			/* Check connection state for fd */
+			if (svc->conn_data.state != SSA_CONN_CONNECTED) {
+				ssa_upstream_svc_client(svc, errnum);
+				fds[2].events = 0;
+			}
+		}
+
+	}
+out:
+	return NULL;
+}
+
+static void ssa_downstream_conn_done(struct ssa_svc *svc, struct ssa_conn *conn)
+{
+	struct ssa_conn_done_msg msg;
+
+	ssa_log_func(SSA_LOG_CTRL);
+	msg.hdr.type = SSA_CONN_DONE;
+	msg.hdr.len = sizeof(msg);
+	msg.conn = conn;
+	write(svc->sock_accessdown[0], (char *) &msg, sizeof msg);
+}
+
+static void *ssa_downstream_handler(void *context)
+{
+	struct ssa_svc *svc = context;
+	struct ssa_ctrl_msg_buf msg;
+	struct pollfd fds[4];
+	int ret, fd;
+
+	ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL, "%s\n", svc->name);
+	msg.hdr.len = sizeof msg.hdr;
+	msg.hdr.type = SSA_CTRL_ACK;
+	write(svc->sock_downctrl[1], (char *) &msg, sizeof msg.hdr);
+
+	fds[0].fd = svc->sock_downctrl[1];
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
+	fds[1].fd = svc->sock_accessdown[0];
+	fds[1].events = POLLIN;
+	fds[1].revents = 0;
+	fds[2].fd = -1;		/* placeholder for listen rsock */
+	fds[2].events = POLLIN;
+	fds[2].revents = 0;
+	fds[3].fd = -1;		/* placeholder for data rsock */
+	fds[3].events = 0;
+	fds[3].revents = 0;
+
+	for (;;) {
+		ret = rpoll(&fds[0], 4, -1);
+		if (ret < 0) {
+			ssa_log_err(SSA_LOG_CTRL, "polling fds %d (%s)\n",
+				    errno, strerror(errno));
+			continue;
+		}
+		if (fds[0].revents) {
+			fds[0].revents = 0;
+			read(svc->sock_downctrl[1], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_downctrl[1],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			case SSA_LISTEN:
+				fds[2].fd = ssa_downstream_listen(svc);
+				break;
+			case SSA_CTRL_EXIT:
+				goto out;
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from ctrl\n",
+					     msg.hdr.type);
+				break;
+			}
+		}
+
+		if (fds[1].revents) {
+			fds[1].revents = 0;
+			read(svc->sock_accessdown[0], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_accessdown[0],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			case SSA_DB_UPDATE:
+ssa_sprint_addr(SSA_LOG_DEFAULT, log_data, sizeof log_data, SSA_ADDR_GID, msg.data.db_upd.remote_gid->raw, sizeof msg.data.db_upd.remote_gid->raw);
+ssa_log(SSA_LOG_DEFAULT, "SSA DB update: GID %s ssa_db %p\n", log_data, msg.data.db_upd.db);
+				/* Now ready to rsend to downstream client upon request */
+				break;
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from access\n",
+					     msg.hdr.type);
+				break;
+			}
+		}
+
+		if (fds[2].revents) {
+			fds[2].revents = 0;
+			fd = ssa_downstream_svc_server(svc);
+			/* Change when more than 1 data connection supported !!! */
+			if (fd >= 0) {
+				fds[3].fd = fd;
+				fds[3].events = POLLIN;
+				if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS)
+					ssa_downstream_conn_done(svc, &svc->conn_data);
+			}
+		}
+
+		if (fds[3].revents) {
+			fds[3].revents = 0;
+		}
+
+	}
+
+out:
+	return NULL;
+}
+
+static void ssa_access_send_db_update(struct ssa_svc *svc, struct ssa_db *db,
+				      int flags, union ibv_gid *remote_gid)
+{
+	struct ssa_db_update_msg msg;
+
+	ssa_log_func(SSA_LOG_CTRL);
+	msg.hdr.type = SSA_DB_UPDATE;
+	msg.hdr.len = sizeof(msg);
+	msg.db_upd.db = db;
+	msg.db_upd.flags = flags;
+	msg.db_upd.remote_gid = remote_gid;
+	write(svc->sock_accessdown[1], (char *) &msg, sizeof(msg));
+}
+
+static void *ssa_access_handler(void *context)
+{
+	struct ssa_svc *svc = context;
+	struct ssa_ctrl_msg_buf msg;
+	struct pollfd fds[3];
+	int ret;
+
+	ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL, "%s\n", svc->name);
+	msg.hdr.len = sizeof msg.hdr;
+	msg.hdr.type = SSA_CTRL_ACK;
+	write(svc->sock_accessctrl[1], (char *) &msg, sizeof msg.hdr);
+
+	fds[0].fd = svc->sock_accessctrl[1];
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
+	fds[1].fd = svc->sock_accessup[1];
+	fds[1].events = POLLIN;
+	fds[1].revents = 0;
+	fds[2].fd = svc->sock_accessdown[1];
+	fds[2].events = POLLIN;
+	fds[2].revents = 0;
+
+	for (;;) {
+		ret = poll(&fds[0], 3, -1);
+		if (ret < 0) {
+			ssa_log_err(SSA_LOG_CTRL, "polling fds %d (%s)\n",
+				    errno, strerror(errno));
+			continue;
+		}
+		if (fds[0].revents) {
+			fds[0].revents = 0;
+			read(svc->sock_accessctrl[1], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_accessctrl[1],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			case SSA_CTRL_EXIT:
+				goto out;
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from ctrl\n",
+					     msg.hdr.type);
+				break;
+			}
+		}
+
+		if (fds[1].revents) {
+			fds[1].revents = 0;
+			read(svc->sock_accessup[1], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_accessup[1],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from upstream\n",
+					     msg.hdr.type);
+                        	break;
+			}
+		}
+
+		if (fds[2].revents) {
+			fds[2].revents = 0;
+			read(svc->sock_accessdown[1], (char *) &msg, sizeof msg.hdr);
+			if (msg.hdr.len > sizeof msg.hdr) {
+				read(svc->sock_accessdown[1],
+				     (char *) &msg.hdr.data,
+				     msg.hdr.len - sizeof msg.hdr);
+			}
+#if 0
+			if (svc->process_msg && svc->process_msg(svc, &msg))
+				continue;
+#endif
+
+			switch (msg.hdr.type) {
+			case SSA_CONN_DONE:
+				ssa_sprint_addr(SSA_LOG_VERBOSE | SSA_LOG_CTRL,
+						log_data, sizeof log_data,
+						SSA_ADDR_GID,
+						msg.data.conn->remote_gid.raw,
+						sizeof msg.data.conn->remote_gid.raw);
+				ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL,
+					"connection done on rsock %d from GID %s\n",
+					msg.data.conn->rsock, log_data);
+				/* First, calculate half world PathRecords for GID */
+				/* ssa_calc_path_records(); */
+				/* Now, tell downstream where this ssa_db struct is */
+				/* Replace NULL with pointer to real struct ssa_db */
+				ssa_access_send_db_update(svc, NULL, 0,
+							  &msg.data.conn->remote_gid);
+				break;
+			default:
+				ssa_log_warn(SSA_LOG_CTRL,
+					     "ignoring unexpected message type %d from downstream\n",
+					     msg.hdr.type);
+				break;
+			}
 		}
 	}
 
+out:
 	return NULL;
 }
 
@@ -634,6 +929,17 @@ static void ssa_ctrl_device(struct ssa_device *dev)
 	ibv_ack_async_event(&event);
 }
 
+static void ssa_ctrl_send_listen(struct ssa_svc *svc)
+{
+	struct ssa_listen_msg msg;
+
+	ssa_log_func(SSA_LOG_CTRL);
+	msg.hdr.type = SSA_LISTEN;
+	msg.hdr.len = sizeof(msg);
+	msg.svc = svc;
+	write(svc->sock_downctrl[0], (char *) &msg, sizeof(msg));
+}
+
 static void ssa_ctrl_port(struct ssa_port *port)
 {
 	struct ssa_svc *svc;
@@ -686,10 +992,21 @@ static void ssa_ctrl_port(struct ssa_port *port)
 	write(svc->sock_upctrl[0], (void *) &msg, msg.hdr.len);
 
 	if (parent)
-		ssa_svc_listen(svc);
+		ssa_ctrl_send_listen(svc);
 }
 
-static void ssa_ctrl_svc_client(struct ssa_svc *svc, int errnum)
+static void ssa_upstream_conn_done(struct ssa_svc *svc, struct ssa_conn *conn)
+{
+	struct ssa_conn_done_msg msg;
+
+	ssa_log_func(SSA_LOG_CTRL);
+	msg.hdr.type = SSA_CONN_DONE;
+	msg.hdr.len = sizeof(msg);
+	msg.conn = conn;
+	write(svc->sock_upctrl[0], (char *) &msg, sizeof msg);
+}
+
+static void ssa_upstream_svc_client(struct ssa_svc *svc, int errnum)
 {
 	int ret, err;
 	socklen_t len;
@@ -697,90 +1014,122 @@ static void ssa_ctrl_svc_client(struct ssa_svc *svc, int errnum)
 	if (errnum == EINPROGRESS)
 		return;
 
-	if (svc->state != SSA_STATE_CONNECTING) {
+	if (svc->conn_data.state!= SSA_CONN_CONNECTING) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"Unexpected consumer event in state %d\n",
-			svc->state);
+			svc->conn_data.state);
 		return;
 	}
 
 	len = sizeof err;
-	ret = rgetsockopt(svc->rsock, SOL_SOCKET, SO_ERROR, &err, &len);
+	ret = rgetsockopt(svc->conn_data.rsock, SOL_SOCKET, SO_ERROR, &err, &len);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rgetsockopt fd %d ERROR %d (%s)\n",
-			svc->rsock, errno, strerror(errno));
+			svc->conn_data.rsock, errno, strerror(errno));
 		return;
 	}
 	if (err) {
 		errno = err;
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"async rconnect fd %d ERROR %d (%s)\n",
-			svc->rsock, errno, strerror(errno));
+			svc->conn_data.rsock, errno, strerror(errno));
 		return;
 	}
 
-	if (ssa_svc_modify(svc, svc->slot, 0) < 0) {
-		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
-			"clearing POLLOUT on slot %d for fd %d failed\n",
-			svc->slot, svc->rsock);
-	}
-
+	memcpy(&svc->conn_data.remote_gid, &svc->primary_parent.path.dgid,
+	       sizeof(union ibv_gid));
+	svc->conn_data.state = SSA_CONN_CONNECTED;
 	svc->state = SSA_STATE_CONNECTED;
+
+	ssa_upstream_conn_done(svc, &svc->conn_data);
 }
 
-static void ssa_ctrl_svc_server(struct ssa_svc *svc, int errnum)
+static int ssa_downstream_svc_server(struct ssa_svc *svc)
 {
-	int fd;
+	int fd, val, ret;
 	struct sockaddr_ib peer_addr;
 	socklen_t peer_len;
 
-	fd = raccept(svc->rsock, NULL, 0);
+	fd = raccept(svc->conn_listen.rsock, NULL, 0);
 	if (fd < 0) {
 		if ((errno == EAGAIN || errno == EWOULDBLOCK))
-			return;		/* ignore these errors */
+			return -1;	/* ignore these errors */
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"raccept fd %d ERROR %d (%s)\n",
-			svc->rsock, errno, strerror(errno)); 
-		return;
+			svc->conn_listen.rsock, errno, strerror(errno)); 
+		return -1;
 	}
 
 	ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 		"new connection accepted on fd %d\n", fd);
 
+	peer_len = sizeof(peer_addr);
 	if (!rgetpeername(fd, (struct sockaddr *) &peer_addr, &peer_len)) {
 		if (peer_addr.sib_family == AF_IB) {
 			ssa_sprint_addr(SSA_LOG_DEFAULT | SSA_LOG_CTRL, log_data, sizeof log_data,
 				SSA_ADDR_GID, (uint8_t *) &peer_addr.sib_addr, peer_len);
 			ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL, "peer GID %s\n", log_data);
+		} else {
+			ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
+				"rgetpeername fd %d family %d not AF_IB\n",
+				fd, peer_addr.sib_family);
+			rclose(fd);
+			return -1;
 		}
+	} else {
+		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
+			"rgetpeername fd %d ERROR %d (%s)\n",
+			fd, errno, strerror(errno));
+		rclose(fd);
+		return -1;
 	}
+
+	val = 1;
+	ret = rsetsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+			  (void *) &val, sizeof(val));
+	if (ret) {
+		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
+			"rsetsockopt TCP_NODELAY ERROR %d (%s)\n",
+			errno, strerror(errno));
+		rclose(fd);
+		return -1;
+	}
+	ret = rfcntl(fd, F_SETFL, O_NONBLOCK);
+	if (ret) {
+		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
+			"rfcntl ERROR %d (%s)\n",
+			errno, strerror(errno));
+		rclose(fd);
+		return -1;
+	}
+
+	svc->conn_data.rsock = fd;
+
+	memcpy(&svc->conn_data.remote_gid, &peer_addr.sib_addr,
+	       sizeof(union ibv_gid));
+	svc->conn_data.state = SSA_CONN_CONNECTED;
+	svc->state = SSA_STATE_CONNECTED;
+
+	return fd;
 }
 
-static void ssa_ctrl_svc(struct ssa_svc *svc, int errnum)
-{
-	if (svc->port->dev->ssa->node_type == SSA_NODE_CONSUMER)
-		ssa_ctrl_svc_client(svc, errnum);
-	else
-		ssa_ctrl_svc_server(svc, errnum);
-}
-
-static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
+static int ssa_upstream_initiate_conn(struct ssa_svc *svc)
 {
 	int dport = 7470;
 	struct sockaddr_ib dst_addr;
 	int ret, val;
 
-	svc->rsock = rsocket(AF_IB, SOCK_STREAM, 0);
-	if (svc->rsock < 0) {
+	svc->conn_data.rsock = rsocket(AF_IB, SOCK_STREAM, 0);
+	if (svc->conn_data.rsock < 0) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rsocket ERROR %d (%s)\n",
 			errno, strerror(errno));
-		return;
+		return -1;
 	}
 
 	val = 1;
-	ret = rsetsockopt(svc->rsock, SOL_SOCKET, SO_REUSEADDR,
+	ret = rsetsockopt(svc->conn_data.rsock, SOL_SOCKET, SO_REUSEADDR,
 			  &val, sizeof val);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
@@ -789,7 +1138,7 @@ static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
 		goto close;
 	}
 
-	ret = rsetsockopt(svc->rsock, IPPROTO_TCP, TCP_NODELAY,
+	ret = rsetsockopt(svc->conn_data.rsock, IPPROTO_TCP, TCP_NODELAY,
 			  (void *) &val, sizeof(val));
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
@@ -797,7 +1146,7 @@ static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
 			errno, strerror(errno));
 		goto close;
 	}
-	ret = rfcntl(svc->rsock, F_SETFL, O_NONBLOCK);
+	ret = rfcntl(svc->conn_data.rsock, F_SETFL, O_NONBLOCK);
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rfcntl ERROR %d (%s)\n",
@@ -805,8 +1154,8 @@ static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
 		goto close;
 	}
 
-	ret = rsetsockopt(svc->rsock, SOL_RDMA, RDMA_ROUTE, &svc->primary_parent,
-			  sizeof(svc->primary_parent));
+	ret = rsetsockopt(svc->conn_data.rsock, SOL_RDMA, RDMA_ROUTE,
+			  &svc->primary_parent, sizeof(svc->primary_parent));
 	if (ret) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
 			"rsetsockopt RDMA_ROUTE ERROR %d (%s)\n",
@@ -820,19 +1169,14 @@ static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
 	dst_addr.sib_sid = htonll(((uint64_t) RDMA_PS_TCP << 16) + dport);
 	dst_addr.sib_sid_mask = htonll(RDMA_IB_IP_PS_MASK);
 	dst_addr.sib_scope_id = 0;
-	memcpy(&dst_addr.sib_addr, &svc->primary_parent.path.dgid, 16);
+	memcpy(&dst_addr.sib_addr, &svc->primary_parent.path.dgid,
+	       sizeof(union ibv_gid));
 	ssa_sprint_addr(SSA_LOG_DEFAULT | SSA_LOG_CTRL, log_data, sizeof log_data,
 			SSA_ADDR_GID, (uint8_t *) &dst_addr.sib_addr,
 			sizeof dst_addr.sib_addr);
 	ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL, "dest GID %s\n", log_data);
 
-	svc->slot = ssa_svc_insert(svc, svc->rsock, POLLOUT);
-	if (svc->slot < 0) {
-		ssa_log_err(SSA_LOG_CTRL, "no service slot available\n");
-		goto close;
-	}
-
-	ret = rconnect(svc->rsock, (const struct sockaddr *) &dst_addr,
+	ret = rconnect(svc->conn_data.rsock, (const struct sockaddr *) &dst_addr,
 		       sizeof(dst_addr));
 	if (ret && (errno != EINPROGRESS)) {
 		ssa_log(SSA_LOG_DEFAULT | SSA_LOG_CTRL,
@@ -841,23 +1185,25 @@ static void ssa_ctrl_initiate_conn(struct ssa_svc *svc)
 		goto close;
 	}
 
+	svc->conn_data.state = SSA_CONN_CONNECTING;
 	svc->state = SSA_STATE_CONNECTING;
 
 	if (ret == 0)
-		ssa_ctrl_svc_client(svc, 0);
+		ssa_upstream_svc_client(svc, 0);
 
-	return;
+	return svc->conn_data.rsock;
 
 close:
-	rclose(svc->rsock);
-	svc->rsock = -1;
+	rclose(svc->conn_data.rsock);
+	svc->conn_data.rsock = -1;
+	return -1;
 }
 
 static int ssa_ctrl_init_fds(struct ssa_class *ssa)
 {
 	struct ssa_device *dev;
 	struct ssa_port *port;
-	int d, p, s, i = 0;
+	int d, p, i = 0;
 
 	ssa->nfds = 1;			/* ssa socketpair */
 	ssa->nfds += ssa->dev_cnt;	/* async device events */
@@ -895,12 +1241,6 @@ static int ssa_ctrl_init_fds(struct ssa_class *ssa)
 			ssa->fds_obj[i++].port = port;
 		}
 	}
-	ssa->sfds_start = i;
-	for (s = 0; s < ssa->nsfds; s++) {
-		ssa->fds[i].fd = -1;
-		ssa->fds_obj[i].type = SSA_OBJ_SVC;
-		ssa->fds_obj[i++].svc = NULL;
-	}
 	return 0;
 }
 
@@ -926,8 +1266,8 @@ static void ssa_ctrl_activate_ports(struct ssa_class *ssa)
 int ssa_ctrl_run(struct ssa_class *ssa)
 {
 	struct ssa_ctrl_msg_buf msg;
-	int i, ret, errnum;
-	struct ssa_ctrl_conn_msg *conn;
+	int i, ret;
+	struct ssa_conn_req_msg *conn;
 
 	ssa_log_func(SSA_LOG_CTRL);
 	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, ssa->sock);
@@ -949,7 +1289,6 @@ int ssa_ctrl_run(struct ssa_class *ssa)
 				    errno, strerror(errno));
 			continue;
 		}
-		errnum = errno;
 
 		for (i = 0; i < ssa->nfds; i++) {
 			if (!ssa->fds[i].revents)
@@ -967,9 +1306,11 @@ int ssa_ctrl_run(struct ssa_class *ssa)
 					     (char *) &msg.hdr.data,
 					     msg.hdr.len - sizeof msg.hdr);
 				switch (msg.hdr.type) {
-				case SSA_CTRL_CONN:
-					conn = (struct ssa_ctrl_conn_msg *) &msg;
-					ssa_ctrl_initiate_conn(conn->svc);
+				case SSA_CONN_REQ:
+					conn = (struct ssa_conn_req_msg *) &msg;
+					write(conn->svc->sock_upctrl[0],
+					      (char *) &msg,
+					      sizeof(struct ssa_conn_req_msg));
 					break;
 				case SSA_CTRL_EXIT:
 					goto out;
@@ -990,15 +1331,11 @@ int ssa_ctrl_run(struct ssa_class *ssa)
 					"port event on fd %d\n", ssa->fds[i].fd);
 				ssa_ctrl_port(ssa->fds_obj[i].port);
 				break;
-			case SSA_OBJ_SVC:
-				ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL,
-					"service event on fd %d\n", ssa->fds[i].fd);
-				ssa_ctrl_svc(ssa->fds_obj[i].svc, errnum);
-				break;
 			}
 		}
 	}
 out:
+	msg.hdr.len = sizeof msg.hdr;
 	msg.hdr.type = SSA_CTRL_ACK;
 	write(ssa->sock[1], (char *) &msg, sizeof msg.hdr);
 	free(ssa->fds);
@@ -1012,10 +1349,10 @@ err:
 
 void ssa_ctrl_conn(struct ssa_class *ssa, struct ssa_svc *svc)
 {
-	struct ssa_ctrl_conn_msg msg;
+	struct ssa_conn_req_msg msg;
 
 	ssa_log_func(SSA_LOG_CTRL);
-	msg.hdr.type = SSA_CTRL_CONN;
+	msg.hdr.type = SSA_CONN_REQ;
 	msg.hdr.len = sizeof msg;
 	msg.svc = svc;
 	write(ssa->sock[0], (char *) &msg, sizeof msg);
@@ -1056,8 +1393,44 @@ struct ssa_svc *ssa_start_svc(struct ssa_port *port, uint64_t database_id,
 
 	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock_upctrl);
 	if (ret) {
-		ssa_log_err(SSA_LOG_CTRL, "creating upstream socketpair\n");
+		ssa_log_err(SSA_LOG_CTRL, "creating upstream/ctrl socketpair\n");
 		goto err1;
+	}
+
+	if (port->dev->ssa->node_type != SSA_NODE_CONSUMER) {
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock_downctrl);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating downstream/ctrl socketpair\n");
+			goto err2;
+		}
+	} else {
+		svc->sock_downctrl[0] = -1;
+		svc->sock_downctrl[1] = -1;
+	}
+
+	if (port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock_accessctrl);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating access/ctrl socketpair\n");
+			goto err3;
+		}
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock_accessup);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating access/upstream socketpair\n");
+			goto err4;
+		}
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock_accessdown);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating access/downstream socketpair\n");
+			goto err5;
+		}
+	} else {
+		svc->sock_accessctrl[0] = -1;
+		svc->sock_accessctrl[1] = -1;
+		svc->sock_accessup[0] = -1;
+		svc->sock_accessup[1] = -1;
+		svc->sock_accessdown[0] = -1;
+		svc->sock_accessdown[1] = -1;
 	}
 
 	svc->index = port->svc_cnt;
@@ -1065,8 +1438,12 @@ struct ssa_svc *ssa_start_svc(struct ssa_port *port, uint64_t database_id,
 	snprintf(svc->name, sizeof svc->name, "%s:%llu", port->name,
 		 (unsigned long long) database_id);
 	svc->database_id = database_id;
-	svc->rsock = -1;
-	svc->slot = -1;
+	svc->conn_listen.rsock = -1;
+	svc->conn_listen.type = SSA_CONN_TYPE_UPSTREAM;
+	svc->conn_listen.state = SSA_CONN_IDLE;
+	svc->conn_data.rsock = -1;
+	svc->conn_data.type = SSA_CONN_TYPE_DOWNSTREAM;
+	svc->conn_data.state = SSA_CONN_IDLE;
 	svc->state = SSA_STATE_IDLE;
 	svc->process_msg = process_msg;
 	//pthread_mutex_init(&svc->lock, NULL);
@@ -1075,21 +1452,75 @@ struct ssa_svc *ssa_start_svc(struct ssa_port *port, uint64_t database_id,
 	if (ret) {
 		ssa_log_err(SSA_LOG_CTRL, "creating upstream thread\n");
 		errno = ret;
-		goto err2;
+		goto err6;
 	}
 
 	ret = read(svc->sock_upctrl[0], (char *) &msg, sizeof msg);
 	if ((ret != sizeof msg) || (msg.type != SSA_CTRL_ACK)) {
 		ssa_log_err(SSA_LOG_CTRL, "with upstream thread\n");
-		goto err3;
+		goto err7;
 
+	}
+
+	if (svc->port->dev->ssa->node_type != SSA_NODE_CONSUMER) {
+		ret = pthread_create(&svc->downstream, NULL, ssa_downstream_handler, svc);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating downstream thread\n");
+			errno = ret;
+			goto err7;
+		}
+
+		ret = read(svc->sock_downctrl[0], (char *) &msg, sizeof msg);
+		if ((ret != sizeof msg) || (msg.type != SSA_CTRL_ACK)) {
+			ssa_log_err(SSA_LOG_CTRL, "with downstream thread\n");
+			goto err8;
+		}
+	}
+
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		ret = pthread_create(&svc->access, NULL, ssa_access_handler, svc);
+		if (ret) {
+			ssa_log_err(SSA_LOG_CTRL, "creating access thread\n");
+			errno = ret;
+			goto err8;
+		}
+
+		ret = read(svc->sock_accessctrl[0], (char *) &msg, sizeof msg);
+		if ((ret != sizeof msg) || (msg.type != SSA_CTRL_ACK)) {
+			ssa_log_err(SSA_LOG_CTRL, "with access thread\n");
+			goto err9;
+		}
 	}
 
 	port->svc[port->svc_cnt++] = svc;
 	return svc;
 
-err3:
+err9:
+	pthread_join(svc->access, NULL);
+err8:
+	pthread_join(svc->downstream, NULL);
+err7:
 	pthread_join(svc->upstream, NULL);
+err6:
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		close(svc->sock_accessdown[0]);
+		close(svc->sock_accessdown[1]);
+	}
+err5:
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		close(svc->sock_accessup[0]);
+		close(svc->sock_accessup[1]);
+	}
+err4:
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		close(svc->sock_accessctrl[0]);
+		close(svc->sock_accessctrl[1]);
+	}
+err3:
+	if (svc->port->dev->ssa->node_type != SSA_NODE_CONSUMER) {
+		close(svc->sock_downctrl[0]);
+		close(svc->sock_downctrl[1]);
+	}
 err2:
 	close(svc->sock_upctrl[0]);
 	close(svc->sock_upctrl[1]);
@@ -1184,6 +1615,13 @@ static void ssa_open_dev(struct ssa_device *dev, struct ssa_class *ssa,
 	for (i = 1; i <= dev->port_cnt; i++)
 		ssa_open_port(ssa_dev_port(dev, i), dev, i);
 
+#ifdef ACCESS_INTEGRATION
+	if (dev->ssa->node_type == SSA_NODE_ACCESS) {
+		/* if configured, invoke SSA DB preloading */
+
+	}
+#endif
+
 	ssa_log(SSA_LOG_VERBOSE | SSA_LOG_CTRL, "%s opened\n", dev->name);
 	return;
 
@@ -1228,11 +1666,35 @@ static void ssa_stop_svc(struct ssa_svc *svc)
 	msg.type = SSA_CTRL_EXIT;
 	write(svc->sock_upctrl[0], (char *) &msg, sizeof msg);
 	pthread_join(svc->upstream, NULL);
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		write(svc->sock_accessctrl[0], (char *) &msg, sizeof msg);
+		pthread_join(svc->access, NULL);
+	}
+	if (svc->port->dev->ssa->node_type != SSA_NODE_CONSUMER) {
+		write(svc->sock_downctrl[0], (char *) &msg, sizeof msg);
+		pthread_join(svc->downstream, NULL);
+	}
 
 	svc->port->svc[svc->index] = NULL;
-	if (svc->rsock >= 0) {
-		rclose(svc->rsock);
-		svc->rsock = -1;
+	if (svc->conn_listen.rsock >= 0) {
+		rclose(svc->conn_listen.rsock);
+		svc->conn_listen.rsock = -1;
+		svc->conn_listen.state = SSA_CONN_IDLE;
+	}
+	if (svc->port->dev->ssa->node_type == SSA_NODE_ACCESS) {
+		close(svc->sock_accessdown[0]);
+		close(svc->sock_accessdown[1]);
+		close(svc->sock_accessctrl[0]);
+		close(svc->sock_accessctrl[1]);
+	}
+	if (svc->port->dev->ssa->node_type != SSA_NODE_CONSUMER) {
+		if (svc->conn_data.rsock >= 0) {
+			rclose(svc->conn_data.rsock);
+			svc->conn_data.rsock = -1;
+			svc->conn_data.state = SSA_CONN_IDLE;
+		}
+		close(svc->sock_downctrl[0]);
+		close(svc->sock_downctrl[1]);
 	}
 	close(svc->sock_upctrl[0]);
 	close(svc->sock_upctrl[1]);
